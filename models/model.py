@@ -202,8 +202,7 @@ class CLAP2LLAMA(nn.Module):
         # ..pass..
         
         # decoder forward pass (input embeds, shifted input ids, shifted attn mask)
-        outputs = self.decoder(input_embeds, shifted_input_ids, shifted_attn_mask)
-        # 
+        outputs = self.decoder(inputs_embeds = input_embeds, labels = shifted_input_ids, attention_mask = shifted_attn_mask)
         return outputs
         
     def forward(self, audio, caption):
@@ -223,6 +222,7 @@ class CLAP2LLAMA(nn.Module):
         return output
     
     def generate_caption_inference(self, audio, caption):
+        
         pass
     
 if __name__ == "__main__":
