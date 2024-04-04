@@ -8,9 +8,15 @@ import random
 from laion_clap.training.data import get_audio_features, int16_to_float32, float32_to_int16
 
 def collate_fn(batch):
-    audio_features, captions, audio_paths = zip(*batch)
-    # retrieved results
-    return audio_features, captions, audio_paths
+    audio_feature, wav_path, caption, topk_audio_feature, topk_caption = zip(*batch)
+    # retrieved results (확인)
+    if topk_audio_feature[0]:
+        topk_audio_feature = list(map(list, zip(*topk_audio_feature))) # B, top_k to top_k, B 와 이거였어!
+        topk_caption = list(map(list, zip(*topk_caption)))
+    else:
+        topk_audio_feature = []
+        topk_caption = []    
+    return audio_feature, wav_path, caption, topk_audio_feature, topk_caption
 
 def load_json_file(files, filtering = None):
     json_data = []
@@ -31,21 +37,22 @@ def load_json_file(files, filtering = None):
                 json_data.append(item)
     return json_data
 
-def load_dataset(data_path, filtering, train):
-    train_dataset = AudioLanguageDataset(data_path, filtering, train)
+def load_dataset(data_path, filtering, train = None, index_path = None, top_k = 2):
+    train_dataset = AudioLanguageDataset(data_path, filtering, train, index_path, top_k)
     return train_dataset
 
-def load_dataloader(config, train_dataset):
+def load_dataloader(config, train_dataset, subset):
     # length 기반의 sampler 추가할지말지 나중에 결정.
-    
+    batch_size = 1 if 'val' in subset else config.data_args.batch_size
+    num_workers = 2 if 'val' in subset else config.data_args.num_workers
     return DataLoader(
         dataset = train_dataset,
-        batch_size= config.data_args.batch_size,
-        num_workers= config.data_args.num_workers,
+        batch_size= batch_size,
+        num_workers= num_workers,
         pin_memory=True,
-        #sampler=sampler,
+        sampler=None,
         shuffle=config.data_args.shuffle,
-        drop_last=True,
+        drop_last=False,
         collate_fn=collate_fn,
     )
 
@@ -68,9 +75,16 @@ def text_preprocess(sentence):
 
 # https://github.com/LAION-AI/CLAP/blob/main/src/laion_clap/hook.py#L120 참고
 class AudioLanguageDataset(Dataset):
-    def __init__(self, json_files, filtering, train = True):
+    def __init__(self, json_files, filtering, train = True, index_path = None, topk = 2):
         # json file 불러오기
         self.json_data = load_json_file(json_files, filtering)
+        
+        # read retrieved result
+        self.index_path = index_path
+        if self.index_path:
+            with open(self.index_path, 'r') as f:
+                self.index = json.load(f)
+                     
         # audio config 따르기
         self.audio_cfg = {
             "audio_length": 1024,
@@ -85,7 +99,8 @@ class AudioLanguageDataset(Dataset):
             "model_type": "HTSAT",
             "model_name": "base"
         }     
-        self.train = True
+        self.train = train
+        self.topk = topk
        
     # clap preprocess 과정
     def preprocess_waveform(self, wav_path, duration):
@@ -118,11 +133,22 @@ class AudioLanguageDataset(Dataset):
         audio_feature = self.preprocess_waveform(wav_path, duration)
         caption = text_preprocess(caption)
         
-        if self.train and isinstance(caption, list):
+        if self.train and isinstance(caption, list): # self.train and
             caption = random.choice(caption)
-        # retrieve context
-        # 일단 Pass
         
-        return audio_feature, wav_path, caption # retr_audio_features, retr_captions
+        topk_audio_feature = []
+        topk_caption = []
+        # retrieve context (topk도 설정할 수 있겠네.)
+        if self.index_path != "":
+            if wav_path in self.index:
+                topk_result = self.index[wav_path]
+                topk_results = topk_result[:self.topk] # topk, batch
+                topk_audio_feature = [self.preprocess_waveform(wav_path, duration) for wav_path, _ in topk_results]
+                topk_caption = [text_preprocess(caption) for _, caption in topk_results]
+                # 각 순서별로 weights 5,4,3,2,1 ?
+                # weights = list(range(len(top_k_result), 0, -1))
+            else:
+                print(wav_path)
+        return audio_feature, wav_path, caption, topk_audio_feature, topk_caption
     
     

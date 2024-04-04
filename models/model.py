@@ -31,8 +31,8 @@ class Projection(nn.Module):
         super().__init__()
         self.linear1 = nn.Linear(d_in, d_out, bias=False)
         self.linear2 = nn.Linear(d_out, d_out, bias=False)
-        # self.layer_norm = nn.LayerNorm(d_out)
-        # self.drop = nn.Dropout(p)
+        self.layer_norm = nn.LayerNorm(d_out)
+        self.drop = nn.Dropout(p)
 
         self.init_weight()
         
@@ -43,10 +43,10 @@ class Projection(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         embed1 = self.linear1(x)
-        embed2 = self.linear2(F.gelu(embed1))
-        #embed2 = self.drop(self.linear2(F.gelu(embed1)))
-        #embeds = self.layer_norm(embed1 + embed2)
-        return embed2
+        # embed2 = self.linear2(F.gelu(embed1))
+        embed2 = self.drop(self.linear2(F.gelu(embed1)))
+        embeds = self.layer_norm(embed1 + embed2)
+        return embeds
     
 # save, load도 따로 만들어줘야하나?
 class CLAP2LLAMA(nn.Module):
@@ -54,8 +54,7 @@ class CLAP2LLAMA(nn.Module):
         super(CLAP2LLAMA, self).__init__()
         self.config = config
         self.device = config.device
-        
-        # 레이어 선언
+
         # audio encoder
         self.encoder_config = CLAPEncoderConfig.from_dict(OmegaConf.to_container(config.encoder, resolve=True))
         self.encoder = CLAPAudioTower(self.encoder_config)
@@ -70,12 +69,11 @@ class CLAP2LLAMA(nn.Module):
             self.tokenizer.model_max_length = self.config.decoder.sequence_max_length
             #self.decoder.config.pad_token_id = self.tokenizer.pad_token_id
         self.task_prompt = self.config.task_prompt
+        # gradient checkpointing
+        self.decoder.gradient_checkpointing_enable()
         
         # alignment module: mlp
-        if self.config.align.model_name == "MLP":
-            # pretrain을 다시 하면...
-            # Projection()
-            
+        if self.config.align.model_name == "MLP":         
             # train을 하면... # encoder_config 설정해주기!
             modules = [
                 nn.Linear(self.encoder_config.hidden_size, self.decoder.config.hidden_size),
@@ -83,10 +81,13 @@ class CLAP2LLAMA(nn.Module):
                 nn.Linear(self.decoder.config.hidden_size, self.decoder.config.hidden_size)
             ]
             self.enc_to_dec_proj = nn.Sequential(*modules)
-            self.forward_align = self.forward_mlp
+        if self.config.align.model_name == "MLP_V2":
+            self.enc_to_dec_proj = Projection(self.encoder_config.hidden_size, self.decoder.config.hidden_size)
+        self.forward_align = self.forward_mlp
         
-        # retrieved context
-        # pass #
+        # retrieved context (prompt는 어떻게 주는 게 낫지?)
+        self.retr_prompt = config.retr_prompt
+        self.task_prompt = config.task_prompt
         
         # freeze parameters (audio, align, language)
         self.freeze_am = config.freeze_am
@@ -105,25 +106,21 @@ class CLAP2LLAMA(nn.Module):
         #     p.requires_grad = False
         
         # 3. freeze language (or lora tuning, 알아서 freeze)
-        # if self.freeze_lm:
-        #     self.decoder.eval()
-        #     for p in self.decoder.parameters():
-        #         p.requires_grad = False
-        # else:
-        #     peft_type = config.peft_config.peft_type
-        #     if peft_type == "LORA":
-        #         peft_config = LoraConfig(**config.peft_config) # task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
-        #         # 아래 두 개는 왜하지? 이게 다른 논문들에서는 어떻게 lora tuning 했는지를 알아야겠다.
-        #         self.decoder.base_model.model.model.embed_tokens.original_module.weight.requires_grad = False
-        #         self.decoder.base_model.model.lm_head.original_module.weight.requires_grad = False
-        #     if peft_type == "IA3":
-        #         self.peft_config = IA3Config(**config.peft_config)
-        #     self.decoder = get_peft_model(self.decoder, peft_config)    
-        #     self.decoder.print_trainable_parameters()
-                
-        # memory 
-        # checkpointing
-        # self.decoder.gradient_checkpointing_enable()
+        if self.freeze_lm: # for pretrain
+            self.decoder.eval()
+            for p in self.decoder.parameters():
+                p.requires_grad = False
+        else: # for train
+            peft_type = config.peft_config.peft_type
+            if peft_type == "LORA":
+                peft_config = LoraConfig(**config.peft_config) # task_type=TaskType.SEQ_2_SEQ_LM, inference_mode=False, r=8, lora_alpha=32, lora_dropout=0.1
+                # 아래 두 개는 왜하지? 이게 다른 논문들에서는 어떻게 lora tuning 했는지를 알아야겠다.
+                self.decoder.base_model.model.model.embed_tokens.original_module.weight.requires_grad = False
+                self.decoder.base_model.model.lm_head.original_module.weight.requires_grad = False
+            if peft_type == "IA3":
+                self.peft_config = IA3Config(**config.peft_config)
+            self.decoder = get_peft_model(self.decoder, self.peft_config)    
+            self.decoder.print_trainable_parameters()
         
     def load_ckpt(self, checkpoint_path):
         self.enc_to_dec_proj.load_state_dict(torch.load(checkpoint_path + "enc_to_dec_proj.bin", map_location=self.device), strict = True)
@@ -132,9 +129,24 @@ class CLAP2LLAMA(nn.Module):
             if os.path.exists(file_path):
                 self.encoder.load_state_dict(torch.load(file_path), strict=False)       
         # 이것도 해야하나? 일단 pass 
-        # if not self.freeze_lm and 'finetuned' in checkpoint_path:
-        #     print("Load LORA model")
-        #     self.decoder = PeftModel.from_pretrained(self.decoder.base_model, checkpoint_path, config=self.peft_config)  # suppose don't use get_peft_model        
+        if not self.freeze_lm and 'finetuned' in checkpoint_path:
+            print("Load LORA model")
+            self.decoder = PeftModel.from_pretrained(self.decoder.base_model, checkpoint_path, config=self.peft_config)  # suppose don't use get_peft_model   
+    
+    def save_ckpt(self, checkpoint_path, epoch):
+        # train / pretrain을 나눠야겠다.
+        # 폴덩 있는지 확인
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path, exist_ok = True)
+        # align module save
+        torch.save(self.enc_to_dec_proj.state_dict(), checkpoint_path + f"enc_to_dec_proj_{epoch}.bin")
+        # IF TRAIN !
+        if self.unfreeze_am:
+            torch.save(self.encoder.state_dict(), checkpoint_path + "audio_encoder.bin")
+        if not self.freeze_lm:
+            # 여기서 에러가 발생한다.
+            self.decoder.save_pretrained(checkpoint_path)
+            # 이게 peft도 포함되는건가?
         
     def forward_encoder(self, audio):
         outputs = self.encoder(audio).last_hidden_state
@@ -156,7 +168,7 @@ class CLAP2LLAMA(nn.Module):
         shifted_attn_mask[:, audio_token_length:] = attn_mask.clone()
         return shifted_input_ids, shifted_attn_mask
     
-    def insert_promt(self, prompt, input_embeds, shifted_input_ids, shifted_attn_mask):
+    def insert_prompt(self, prompt, input_embeds, shifted_input_ids, shifted_attn_mask):
         if prompt:
             prompts = [prompt] * input_embeds.shape[0]
             # prompt_ids, prompt_mask (여기서는 중간에 추가하기때문에 special token을 추가할 필요가 없다.)
@@ -183,37 +195,68 @@ class CLAP2LLAMA(nn.Module):
         attention_mask = tokenized_text['attention_mask'].to(device)   
         return input_ids, attention_mask
     
-    def forward_decoder(self, proj_audio_embed, caption):
+    def forward_decoder(self, proj_audio_embed, caption, proj_retr_audio_embeds, topk_caption):
         # text input 준비 (tokenize -> ids, attention mask)
         input_ids, attn_mask = self.preprocess_text(caption, proj_audio_embed.device, add_special_tokens = True)
-        
+    
         # concat audio, text
         token_embeddings = self.get_decoder_embeddings()(input_ids)
-        proj_audio_embed = proj_audio_embed.unsqueeze(1) # dimension 문제가 있을 것 같아서 늘림, clap에서 처리했나 확인하기
+        # proj_audio_embed = proj_audio_embed.unsqueeze(1) # dimension 문제가 있을 것 같아서 늘림, clap에서 처리했나 확인하기
         input_embeds = torch.concat((proj_audio_embed, token_embeddings), dim = 1)
         
         # shifting & padding input ids
         shifted_input_ids, shifted_attn_mask = self.shift_tokenized_input(input_ids, attn_mask, proj_audio_embed.shape[1], proj_audio_embed.device)
         
         # inserting prompts: task_prompt
-        input_embeds, shifted_input_ids, shifted_attn_mask = self.insert_promt(self.task_prompt, input_embeds, shifted_input_ids, shifted_attn_mask)
+        input_embeds, shifted_input_ids, shifted_attn_mask = self.insert_prompt(self.task_prompt, input_embeds, shifted_input_ids, shifted_attn_mask)
 
-        # handling retrieved results
-        # ..pass..
+        batch_size = input_ids.shape[0]
+        # handling retrieved results # 시작과 끝에 bos, eos를 붙여야지. # 여기도 배치사이즈만큼 들어와야하지 않니?
+        for idx, (retr_audio_embed, retr_caption) in enumerate(zip(proj_retr_audio_embeds, topk_caption)):   
+            # caption
+            retr_input_ids, retr_attn_mask = self.preprocess_text(retr_caption, proj_audio_embed.device, add_special_tokens = False)
+            retr_token_embeddings = self.get_decoder_embeddings()(retr_input_ids)
+            retr_input_ids[:, :] = -100  # -> 이 부분은 내가 보기에는 학습하면 좋겠는데? bos, eos도 추가해야겠는데? 일단은 baseline을 구해보고 할까 아니면 그냥 할까?
+            shifted_input_ids = torch.cat((retr_input_ids, shifted_input_ids), dim = 1)
+            shifted_attn_mask = torch.cat((retr_attn_mask, shifted_attn_mask), dim = 1)
+            input_embeds = torch.cat((retr_token_embeddings, input_embeds), dim = 1)
+            # audio ( batch size, prefix sixze )
+            retr_input_ids = torch.zeros((batch_size, retr_audio_embed.shape[1]), dtype = int).to(proj_audio_embed.device)
+            retr_input_ids[:, :] = -100
+            # shape이 맞는지 확인하기
+            retr_attn_mask = torch.ones((batch_size, retr_audio_embed.shape[1]), dtype = int).to(proj_audio_embed.device)
+            shifted_input_ids = torch.cat((retr_input_ids, shifted_input_ids), dim = 1)
+            shifted_attn_mask = torch.cat((retr_attn_mask, shifted_attn_mask), dim = 1)
+            input_embeds = torch.cat((retr_audio_embed, input_embeds), dim = 1)
+        # 3. insert prompt
+        # retr prompt <- top2 audio ,top2 caption <- top1 audio, top1 caption <- task prompt <- query audio <- query caption
+        # input ids, attn mask, input embeds (text, audio)
+        input_embeds, shifted_input_ids, shifted_attn_mask = self.insert_prompt(self.retr_prompt, input_embeds, shifted_input_ids, shifted_attn_mask)
         
-        # decoder forward pass (input embeds, shifted input ids, shifted attn mask)
+        # decoder forward pass (input embeds, shifted input ids, shifted attn mask: pad는 attn을 안한다.)
         outputs = self.decoder(inputs_embeds = input_embeds, labels = shifted_input_ids, attention_mask = shifted_attn_mask)
         return outputs
+    
+    # inference가 아니라 train이니깐 caption도 같이 넣어준다.
+    def forward(self, audio, caption, topk_audio = None, topk_caption = None):
+        # pretrain: audio
+        # train: topk, audio
         
-    def forward(self, audio, caption):
+        # retrieved result # 실제로 보면서 확인해야겠네.
+        if topk_audio and topk_caption:
+            proj_retr_audio_embeds = []
+            for i, retr_audio in enumerate(topk_audio):
+                retr_audio_embed = self.forward_encoder(retr_audio)
+                proj_retr_audio_embed = self.forward_align(retr_audio_embed)
+                proj_retr_audio_embeds.append(proj_retr_audio_embed)
+        
         # audio encoder
         audio_embed = self.forward_encoder(audio)
-        
         # align
-        proj_audio_embed = self.forward_align(audio_embed)
+        proj_audio_embed = self.forward_align(audio_embed) # retr_audio_embeds
         
         # decoder
-        output = self.forward_decoder(proj_audio_embed, caption)
+        output = self.forward_decoder(proj_audio_embed, caption, proj_retr_audio_embeds, topk_caption) # proj_topk_audio_embed, topk_caption
         
         # loss
         if output['loss'] is None:
@@ -221,9 +264,65 @@ class CLAP2LLAMA(nn.Module):
         
         return output
     
-    def generate_caption_inference(self, audio, caption):
-        
-        pass
+    def generate_caption_inference(self, audio, topk_audio, topk_caption):
+        with torch.no_grad():        
+            # audio_Embed
+            audio_embed = self.forward_encoder(audio)
+            # proj_audio_embed
+            proj_audio_embed = self.forward_align(audio_embed)
+            
+            # bos token
+            bos_token_id = self.tokenizer.bos_token_id
+            bos_tensor = torch.tensor(bos_token_id).to(proj_audio_embed.device)
+            bos_embed = self.get_decoder_embeddings()(bos_tensor)
+            bos_embed = bos_embed.view(1,1,-1)
+            
+            input_embeds = torch.cat((bos_embed, proj_audio_embed), dim = 1)
+            ####################################################################################
+            # prompt
+            # prompt = "generate caption of audio: "
+            # input_ids, attn_mask = self.preprocess_text(prompt, proj_audio_embed.device, add_special_tokens = True)
+            # token_embeddings = self.get_decoder_embeddings()(input_ids)
+
+            # input_embeds = torch.concat((proj_audio_embed, token_embeddings), dim = 1)
+            ####################################################################################
+            batch_size, audio_token_length = input_embeds.shape[0], input_embeds.shape[1]
+            shifted_attn_mask = input_embeds.new_ones((batch_size, audio_token_length)).long() # 이게 왜 필요하지?
+            ####################################################################################
+            
+            # retrieval
+            for idx, (retr_audio, retr_caption) in enumerate(zip(topk_audio, topk_caption)):
+                if topk_audio and topk_caption: # batch size
+                    # caption
+                    input_ids, attn_mask = self.preprocess_text(retr_caption, proj_audio_embed.device, add_special_tokens = False)
+                    token_embed = self.get_decoder_embeddings()(input_ids)
+                    input_embeds = torch.cat((token_embed, input_embeds), dim = 1)
+                    shifted_attn_mask = torch.cat((attn_mask, shifted_attn_mask), dim = 1)
+                    # audio
+                    retr_audio_embed = self.forward_encoder(retr_audio)
+                    proj_retr_audio_embed = self.forward_align(retr_audio_embed)
+                    input_embeds = torch.cat((proj_retr_audio_embed, input_embeds), dim = 1)
+                    retr_audio_attn_mask = torch.ones((audio_embed.shape[0], proj_retr_audio_embed.shape[1]), dtype = int).to(proj_retr_audio_embed.device)
+                    shifted_attn_mask = torch.cat((retr_audio_attn_mask, shifted_attn_mask), dim = 1)
+            # insert prompt
+            input_embeds, _, shifted_attn_mask = self.insert_prompt(self.retr_prompt, input_embeds, None, shifted_attn_mask)
+            
+            outputs = self.decoder.generate(
+                inputs_embeds=input_embeds,
+                attention_mask=shifted_attn_mask,
+                num_beams=4,
+                min_length=0,
+                max_new_tokens=256,
+                top_p=0.9,
+                do_sample=True,
+                repetition_penalty=1.1,
+                use_cache=True,
+                #generation_config=self.generation_config,
+            )
+            # pad token id가 0으로 되어있는데 확인 필요!
+            captions = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        return captions
+
     
 if __name__ == "__main__":
     def get_config(args):
@@ -238,15 +337,18 @@ if __name__ == "__main__":
     # config 파일 불러오기
     config = get_config(args)
     
-    # audio_data, _ = librosa.load('./examples/Yb0RFKhbpFJA.flac', sr=48000)
+    audio_data, _ = librosa.load('./examples/Yb0RFKhbpFJA.flac', sr=48000)
     # text_data = "Wind and a man speaking are heard, accompanied by buzzing and ticking."
-    # audio_data = audio_data.reshape(1, -1)  # Make it (1,T) or (N,T)
-    # audio_data = torch.tensor(audio_data).to("cuda")
+    audio_data = audio_data.reshape(1, -1)  # Make it (1,T) or (N,T)
+    audio_data = torch.tensor(audio_data).to("cuda")
     
-    audio_caption_model = CLAP2LLAMA(config) # .to("cuda")
+    audio_caption_model = CLAP2LLAMA(config.model_args).to('cuda') # .to("cuda")
     # output = audio_caption_model(audio_data, text_data)
     # print(f"loss : {output['loss']}")
     # print(f"logits : {output['logits'].shape}")  # logits : torch.Size([1, 19, 32000])
 
-    # captions = audio_caption_model.generate_caption(audio_data)
-    # print(f"captions : {captions}")
+    captions = audio_caption_model.generate_caption_inference(audio_data)
+    print(f"captions : {captions}")
+    
+    # captions = audio_caption_model.generate_beam(embed=None, prompt="What is dog? Explain short and breif way. ")
+    # print(f"generation with prompt : {captions[0]}")

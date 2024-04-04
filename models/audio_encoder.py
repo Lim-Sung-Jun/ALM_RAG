@@ -32,7 +32,7 @@ class CLAPEncoderConfig(PretrainedConfig):
         # self.hidden_size = 768
         # self.window_size = 4 # (32,32) = [B,32,H], (16,16) = [B,64,H], (8,8) = [B,128,H] (4,4) = [B,256,H]
         # self.step_size = 4
-    
+
 class CLAPAudioTower(PreTrainedModel):
     config_class = CLAPEncoderConfig
     
@@ -56,15 +56,14 @@ class CLAPAudioTower(PreTrainedModel):
             for k in keys:
                 input_dict[k] = torch.cat([d[k].unsqueeze(0) for d in data], dim=0).to(device)
             audio_embeds = self.encode_audio(input_dict, device=device)
-            audio_embeds = audio_embeds[select_feature]
-            audio_embeds = F.normalize(audio_embeds, dim=-1)
             if select_feature == "fine_grained_embedding":
                 embeds = audio_embeds[select_feature] # [B,1024,768]
+                # audio_embeds = F.normalize(embeds, dim=-1)
                 unfolded = embeds.unfold(1, window_size, step_size) # [B,1024/S,768,W]
                 averaged = unfolded.mean(dim=-1) # [B,1024/S,768]
-                return averaged
+                return averaged # embeds
             else:
-                return audio_embeds
+                return audio_embeds[select_feature]
         self.clap.model.get_audio_embedding = types.MethodType(get_audio_embedding_patch, self.clap.model)
         
         # original function

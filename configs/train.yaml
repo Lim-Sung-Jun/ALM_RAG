@@ -1,23 +1,37 @@
-experiment: 'train'
+exp_name: 'train&pretrain'
 seed: 20
 train: True
 
 # dataset, model, hyperparameter, 학습방법, index
 # dataset
+pretrain_dataset: [
+  '/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/BBC_Sound_Effects/bbc_final.json',
+  '/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/FreeSound/fsd_final.json',
+  '/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/SoundBible/sb_final.json',
+  "/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/AudioSet_SL/as_final.json",
+]
+
 train_dataset: [
   '/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/AudioSet/train.json',
   '/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/Clotho/train.json',
 ]
 val_dataset: [
-  "/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/Clotho/val.json",
+  "/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/Clotho/val.json",  
+  # "/drl_nas1/ckddls1321/dev/DL/AudioRAG/data/json_files/AudioSet/val.json",
 ]
-filtering: ""
+
+fitered_dataset: [
+  "/home/sungjun/projects/ALM_RAG/filtered_kb.json"
+]
+filtering: "" # /drl_nas1/ckddls1321/data/WavCaps/json_files/blacklist/blacklist_exclude_test_ac.json
 
 # data args
 data_args:
   dataset: "Clotho"
-  global_batch_size: 256
-  batch_size: 4
+  # multiprocess와 accumulation을 통해서 이루고 싶은 batch size 여기서 256이면 accumulation step이 256//16이 되어야한다.
+  global_batch_size: 256 # 128 256 ...
+  # single process가 다루는 배치사이즈 -> 4 gpus (16) -> accumulation step 4: (64)
+  batch_size: 32
   num_workers: 4
   shuffle: False
 
@@ -36,30 +50,30 @@ audio_args:
 model_args:
   name: "CLAP2LLAMA"
   retr_prompt: ""
-  task_prompt: "describe audio briefly"
+  task_prompt: "" # describe audio briefly
   freeze_am: True
   unfreeze_am: [] # 특정 layer만 unfreeze
-  freeze_lm: True # peft나 finetuning을 하면 false로 둔다.
-  checkpoint_path: "./pretrained_models/pretrained_MLP/"
-  device: "cuda:0"
+  freeze_lm: False # peft나 finetuning을 하면 false로 둔다. 
+  checkpoint_path: "./finetuned_models/finetuned_MLP_IA3/" # ./finetuned_models/finetuned_MLP_IA3 # ./pretrained_models/pretrained_MLP/
+  device: "cuda"
   encoder:
     model_name: "CLAPAudioEncoder"
     pretrained: True
     freeze: True
     # fine grained, embedding, projected
-    select_feature: "embedding"
+    select_feature: "fine_grained_embedding"
     sequence_length: 1024
     hidden_size: 768
     window_size: 32
     step_size: 16
-    device: "cuda:0"
+    device: "cuda"
   align:
-    model_name: "MLP"
+    model_name: "MLP" # MLP, MLP_V2
   peft_config:
-    peft_type: "IA3"
+    peft_type: "IA3" # lora
     task_type: "CAUSAL_LM"
-    target_modules: ["q_proj", "v_proj", "down_proj"] # k?
-    feedforward_modules: ["down_proj"]
+    # target_modules: ["q_proj", "v_proj", "down_proj"] # k?
+    # feedforward_modules: ["down_proj"]
   decoder:
     sequence_max_length: 256
 
@@ -76,13 +90,16 @@ optim_args:
 
 # 학습방법
 training:
-  warmup_epochs: 1
-  epochs: 10
+  warmup_epochs: 2
+  epochs: 10 # 10
   clip_grad: 2
-  output_path: "./finetuned_models/finetuned_MLP/"
-  eval: False
+  output_path: "./pretrained_models/lora_tuning_with_rag_MLP/" # pretrained_MLP (mlp_v1 pretrain), finetuned_MLP_V2 (mlp_v2 pretrain), lora_tuning_with_rag_MLP (lora tuning with rag)
+  eval: True
   validate: False
 
 retrieval:
-  index_path: "/data1/sungjun/data/final_index_big_kb_audiocaps/audio2audio_train.json"
-  top_k: 2
+  train_index_path: "/data1/sungjun/index/data/final_index_big_kb_audiocaps/audio2audio_train.json" # 이게 어디 저장되어있더라
+  val_index_path: "/home/sungjun/projects/ALM_RAG/filtered_data/audio2audio2audio2audio.json" # "/data1/sungjun/index/data/final_index_QcapsVal&clothoVal_KBbase&large&huge/caps_val2huge_audio.json" # clotho_val2huge_audio.json
+  index_save_path: "./filtered_data/" # /data1/sungjun/index/data/audio&text2audio&text_QclothoVal_KBlargeAudio&Text/
+  index_types: ["audio&text"]
+  topk: 5

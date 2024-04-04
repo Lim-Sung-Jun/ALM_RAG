@@ -1,5 +1,5 @@
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "2"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0,1"
 
 from utils.utils import fix_seed, get_config, AverageMeter
 from dataset.dataload import load_dataset, load_dataloader
@@ -11,7 +11,6 @@ import sys
 import time
 from omegaconf import OmegaConf
 from datetime import datetime
-import yaml
 
 import torch
 from torch import optim
@@ -46,15 +45,13 @@ def validate(val_dataloader, model):
     
     # 데이터 샘플링 (나중에 retrieved result도 확인하기)
     for i, batch in tqdm(enumerate(val_dataloader), total=len(val_dataloader)): # len(val_dataloader)
-        audio, audio_path, caption, topk_audio, topk_caption = batch
-        # if not retr_captions: # If retrieved results is missing, num_captions = 5, choose 1
-        #     retr_captions = [[texts[0] for texts in caption]]
+        audio, audio_path, caption = batch
         with accelerator.autocast():
             # 모델에 넣고 generate
-            generated_caption = unwrapped_model.generate_caption_inference(audio, topk_audio, topk_caption)
-            print(f"topk = {topk_caption}")
-            print(f"generated = {generated_caption}")
-            print(f"caption = {caption}")
+            generated_caption = unwrapped_model.generate_caption_inference(audio)
+            # if epoch > 7:
+            print(generated_caption)
+            print(caption)
             # generate cpations에 저장
             gen_captions.extend(generated_caption)
             ref_captions.extend(caption)
@@ -90,8 +87,11 @@ def train(epoch, train_dataloader, model, optimizer, lr_scheduler, clip_norm):
     model.train()
     epoch_loss = AverageMeter()
     epoch_start_time = time.time()
+    
     # from itertools import islice
-    # sliced_train_dataloader = islice(train_dataloader, 10)    
+    # num_iteration = 10
+    # train_dataloader = islice(train_dataloader, num_iteration)
+    ####
     pbar = tqdm(enumerate(train_dataloader), desc = "iteration training", total = int(len(train_dataloader))) # int(len(train_dataloader))
     for idx, batch in pbar:
         # step마다 lr이 조정되는 값을 확인하기 위해서 사용한다.
@@ -100,10 +100,10 @@ def train(epoch, train_dataloader, model, optimizer, lr_scheduler, clip_norm):
         # gradient accumulation
         with accelerator.accumulate(model):
             optimizer.zero_grad()
-            audio, audio_path, caption, topk_audio, topk_caption = batch
+            audio, audio_path, caption = batch
             # mixed precision
             with accelerator.autocast(): # 이건 지워도 보고 그냥도 해보자. 성능 차이를 확인해보자.
-                outputs = model(audio, caption, topk_audio, topk_caption)
+                outputs = model(audio, caption)
             loss = outputs['loss']
             accelerator.backward(loss)
             # gradient cliping
@@ -147,16 +147,16 @@ def main():
     
     # wandb
     today_str = datetime.now().strftime("%Y%m%d")
-    exp_name = 'train' + "_" + config.model_args.align.model_name + f"_lr_{config.optim_args.lr}_batch_{config.data_args.global_batch_size}_seed_{config.seed}_{today_str}"
-    # accelerator.init_trackers(
-    #     project_name="audio-captioning",
-    #     config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
-    #     init_kwargs={"wandb": {"name": exp_name}}
-    # )
+    exp_name = 'pretrain' + "_" + config.model_args.align.model_name + f"_lr_{config.optim_args.lr}_batch_{config.data_args.global_batch_size}_seed_{config.seed}_{today_str}"
+    accelerator.init_trackers(
+        project_name="audio-captioning",
+        config=OmegaConf.to_container(config, resolve=True, throw_on_missing=True),
+        init_kwargs={"wandb": {"name": exp_name}}
+    )
     
     # 데이터셋 불러오기
-    train_dataset = load_dataset(config.train_dataset, config.filtering, config.train, config.retrieval.train_index_path, config.retrieval.topk) # config.retrieval.train_index_path
-    val_dataset = load_dataset(config.val_dataset, config.filtering, False, config.retrieval.val_index_path, config.retrieval.topk) # config.retrieval.val_index_path
+    train_dataset = load_dataset(config.pretrain_dataset, config.filtering, config.train)
+    val_dataset = load_dataset(config.val_dataset, config.filtering)
     
     # 데이터로더 불러오기
     train_dataloader = load_dataloader(config, train_dataset, 'train')
@@ -164,6 +164,7 @@ def main():
     
     # 모델 불러오기
     model = CLAP2LLAMA(config.model_args)
+    # model.to(device)
 
     # trained weights (align module을 특별하게 만들기 위해서 따로 뺴놓은듯)
     if config.model_args.checkpoint_path:
@@ -178,7 +179,8 @@ def main():
     optimizer = optim.AdamW(model.parameters(), lr=config.optim_args.lr, betas=config.optim_args.betas, eps=config.optim_args.eps, weight_decay=config.optim_args.weight_decay, fused=False)
     scheduler = transformers.get_cosine_schedule_with_warmup(optimizer, warmup_steps, train_steps)
     # acculerator 사용
-    train_dataloader, model, optimizer, scheduler = accelerator.prepare(train_dataloader, model, optimizer, scheduler) # model train_dataloader # 이걸 실행하면 메모리 에러가 난다. 그러니깐 accelerator가 어떤 문제를 발생시키는데? # model.to(device)
+    train_dataloader, model, optimizer, scheduler = accelerator.prepare(train_dataloader, model, optimizer, scheduler) # model train_dataloader # 이걸 실행하면 메모리 에러가 난다. 그러니깐 accelerator가 어떤 문제를 발생시키는데?
+    # load clap model pretrained weight -> 애초에 모델 불러오는 부분이 문제임.
     # model.encoder.clap.load_ckpt()
     
     # test
@@ -187,11 +189,6 @@ def main():
     # eval only code
     if config.training.eval:
         validate(val_dataloader, model)
-        # save
-        path = config.model_args.checkpoint_path + exp_name + ".yaml"
-        yaml_str = OmegaConf.to_yaml(config)
-        with open(path, 'w') as file:
-            file.write(yaml_str)
         accelerator.wait_for_everyone()
         accelerator.end_training()
         sys.exit()
@@ -209,22 +206,11 @@ def main():
                 save_ckpt = metrics_all["spider"] >= max(spiders) 
                 if save_ckpt:
                     unwrapped_model = accelerator.unwrap_model(model)
-                    unwrapped_model.save_ckpt(config.training.output_path, epoch)
-                    
+                    unwrapped_model.save_ckpt(config.training.output_path)
         accelerator.wait_for_everyone()
     accelerator.end_training()
-    
-    # save
-    path = config.model_args.checkpoint_path + exp_name + ".yaml"
-    yaml_str = OmegaConf.to_yaml(config)
-    with open(path, 'w') as file:
-        file.write(yaml_str)
-
-    # end
-    print('train safe')
 
 if __name__ == "__main__":
     main()
-    
     
     
